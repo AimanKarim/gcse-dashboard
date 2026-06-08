@@ -1,128 +1,58 @@
 /**
  * app/api/process/route.ts
  *
- * Thin proxy — forwards the two PDFs + paper label to the Railway
- * Python backend, then polls for progress and streams status updates
- * back to the browser as Server-Sent Events.
+ * Thin proxy — forwards the two PDFs + paper label to Railway,
+ * then immediately returns the job_id.
  *
- * The actual pipeline (extract → rewrite → prompt → test) runs entirely
- * on Railway. This file contains zero pipeline logic.
+ * The browser polls /api/poll/:jobId for progress updates.
+ * No long-lived connection = no Vercel 60s timeout.
  */
 
-import { NextRequest } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
 
 export const dynamic = 'force-dynamic';
-export const maxDuration = 60; // only needs to cover the initial POST + first poll
+export const maxDuration = 30; // just needs to cover the upload POST
 
-const RAILWAY_URL = process.env.RAILWAY_API_URL; // e.g. https://web-production-af56d.up.railway.app
-
-function send(controller: ReadableStreamDefaultController, type: string, message: string) {
-  const data = JSON.stringify({ type, message });
-  controller.enqueue(new TextEncoder().encode(`data: ${data}\n\n`));
-}
+const RAILWAY_URL = process.env.RAILWAY_API_URL;
 
 export async function POST(req: NextRequest) {
-  const stream = new ReadableStream({
-    async start(controller) {
-      try {
-        if (!RAILWAY_URL) {
-          send(controller, 'error', '❌ RAILWAY_API_URL is not set');
-          controller.close();
-          return;
-        }
+  if (!RAILWAY_URL) {
+    return NextResponse.json({ error: 'RAILWAY_API_URL is not set' }, { status: 500 });
+  }
 
-        // ── Step 1: Forward the upload to Railway ──────────────────────
-        send(controller, 'info', '📤 Uploading PDFs to pipeline...');
+  const formData = await req.formData();
 
-        const formData = await req.formData();
+  const questionFile = formData.get('questionPdf') as File;
+  const markingFile  = formData.get('markSchemePdf') as File;
+  const paperLabel   = formData.get('paperLabel') as string;
 
-        // Railway expects: question_pdf, marking_pdf, paper_label
-        const railwayForm = new FormData();
-        const questionFile = formData.get('questionPdf') as File;
-        const markingFile  = formData.get('markSchemePdf') as File;
-        const paperLabel   = formData.get('paperLabel') as string;
+  if (!questionFile || !markingFile || !paperLabel) {
+    return NextResponse.json({ error: 'Missing files or paper label' }, { status: 400 });
+  }
 
-        if (!questionFile || !markingFile || !paperLabel) {
-          send(controller, 'error', '❌ Missing files or paper label');
-          controller.close();
-          return;
-        }
+  // Forward to Railway with the field names the Python backend expects
+  const railwayForm = new FormData();
+  railwayForm.append('question_pdf', questionFile);
+  railwayForm.append('marking_pdf',  markingFile);
+  railwayForm.append('paper_label',  paperLabel);
 
-        railwayForm.append('question_pdf', questionFile);
-        railwayForm.append('marking_pdf',  markingFile);
-        railwayForm.append('paper_label',  paperLabel);
+  let startRes: Response;
+  try {
+    startRes = await fetch(`${RAILWAY_URL}/pipeline/start`, {
+      method: 'POST',
+      body: railwayForm,
+      // @ts-ignore — required in Node 18 for streaming form bodies
+      duplex: 'half',
+    });
+  } catch (err: any) {
+    return NextResponse.json({ error: `Could not reach Railway: ${err.message}` }, { status: 502 });
+  }
 
-        const startRes = await fetch(`${RAILWAY_URL}/pipeline/start`, {
-          method: 'POST',
-          body: railwayForm,
-        });
+  if (!startRes.ok) {
+    const text = await startRes.text();
+    return NextResponse.json({ error: `Railway error: ${text}` }, { status: 502 });
+  }
 
-        if (!startRes.ok) {
-          const err = await startRes.text();
-          send(controller, 'error', `❌ Railway rejected the request: ${err}`);
-          controller.close();
-          return;
-        }
-
-        const { job_id } = await startRes.json();
-        send(controller, 'info', `🚀 Pipeline started (job: ${job_id})`);
-        send(controller, 'info', `📄 Processing: ${paperLabel}`);
-
-        // ── Step 2: Poll Railway for progress ──────────────────────────
-        let done = false;
-        let lastLabel = '';
-
-        while (!done) {
-          await new Promise(r => setTimeout(r, 3000)); // poll every 3 seconds
-
-          const statusRes = await fetch(`${RAILWAY_URL}/pipeline/status/${job_id}`);
-          if (!statusRes.ok) {
-            send(controller, 'error', '❌ Could not reach Railway status endpoint');
-            break;
-          }
-
-          const job = await statusRes.json();
-
-          // Only send a message when the label changes (avoid spam)
-          if (job.stage_label !== lastLabel) {
-            const emoji = job.stage === 1 ? '🔍' : job.stage === 2 ? '✏️' : job.stage === 3 ? '🔧' : job.stage === 4 ? '🧪' : '⏳';
-            send(controller, 'info', `${emoji} ${job.stage_label}`);
-            if (job.rows_total > 0) {
-              send(controller, 'info', `   Questions found: ${job.rows_total}`);
-            }
-            lastLabel = job.stage_label;
-          }
-
-          if (job.status === 'done') {
-            send(controller, 'success', `✅ Pipeline complete! ${job.rows_total} questions processed.`);
-            send(controller, 'info', `📊 Results are ready — refresh the dashboard to review.`);
-            send(controller, 'done', 'done');
-            done = true;
-          } else if (job.status === 'failed') {
-            send(controller, 'error', `❌ Pipeline failed: ${job.stage_label}`);
-            if (job.error) {
-              // Send first line of traceback only
-              const firstLine = job.error.split('\n').filter(Boolean).pop() || job.error;
-              send(controller, 'error', firstLine);
-            }
-            done = true;
-          }
-        }
-
-        controller.close();
-
-      } catch (err: any) {
-        send(controller, 'error', `❌ ${err.message}`);
-        controller.close();
-      }
-    }
-  });
-
-  return new Response(stream, {
-    headers: {
-      'Content-Type':  'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection':    'keep-alive',
-    },
-  });
+  const { job_id } = await startRes.json();
+  return NextResponse.json({ job_id });
 }

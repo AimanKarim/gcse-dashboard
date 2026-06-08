@@ -3,68 +3,103 @@
 import { useState, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 
-type ProgressEvent = {
+type LogEntry = {
   type: 'info' | 'success' | 'error' | 'done';
   message: string;
 };
 
 export default function Home() {
   const router = useRouter();
-  const [questionPdf, setQuestionPdf] = useState<File | null>(null);
+  const [questionPdf, setQuestionPdf]     = useState<File | null>(null);
   const [markSchemePdf, setMarkSchemePdf] = useState<File | null>(null);
-  const [paperLabel, setPaperLabel] = useState('');
-  const [processing, setProcessing] = useState(false);
-  const [progress, setProgress] = useState<ProgressEvent[]>([]);
-  const [done, setDone] = useState(false);
-  const progressRef = useRef<HTMLDivElement>(null);
+  const [paperLabel, setPaperLabel]       = useState('');
+  const [processing, setProcessing]       = useState(false);
+  const [log, setLog]                     = useState<LogEntry[]>([]);
+  const [done, setDone]                   = useState(false);
+  const logRef     = useRef<HTMLDivElement>(null);
+  const pollRef    = useRef<ReturnType<typeof setInterval> | null>(null);
+  const lastLabel  = useRef('');
 
-  function addProgress(event: ProgressEvent) {
-    setProgress(prev => {
-      const updated = [...prev, event];
-      setTimeout(() => progressRef.current?.scrollTo({ top: progressRef.current.scrollHeight, behavior: 'smooth' }), 50);
-      return updated;
+  function addLog(entry: LogEntry) {
+    setLog(prev => {
+      const next = [...prev, entry];
+      setTimeout(() => logRef.current?.scrollTo({ top: logRef.current.scrollHeight, behavior: 'smooth' }), 50);
+      return next;
     });
+  }
+
+  function stopPolling() {
+    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
   }
 
   async function handleProcess() {
     if (!questionPdf || !markSchemePdf || !paperLabel.trim()) return;
 
     setProcessing(true);
-    setProgress([]);
+    setLog([]);
     setDone(false);
+    lastLabel.current = '';
+
+    // ── Step 1: Upload PDFs to Railway via our API proxy ──────────────
+    addLog({ type: 'info', message: '📤 Uploading PDFs to pipeline...' });
 
     const formData = new FormData();
-    formData.append('questionPdf', questionPdf);
+    formData.append('questionPdf',   questionPdf);
     formData.append('markSchemePdf', markSchemePdf);
-    formData.append('paperLabel', paperLabel.trim());
+    formData.append('paperLabel',    paperLabel.trim());
 
+    let jobId: string;
     try {
       const res = await fetch('/api/process', { method: 'POST', body: formData });
-      if (!res.body) throw new Error('No response body');
-
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-
-      while (true) {
-        const { done: streamDone, value } = await reader.read();
-        if (streamDone) break;
-
-        const text = decoder.decode(value);
-        const lines = text.split('\n').filter(l => l.startsWith('data: '));
-
-        for (const line of lines) {
-          try {
-            const event: ProgressEvent = JSON.parse(line.replace('data: ', ''));
-            addProgress(event);
-            if (event.type === 'done') setDone(true);
-          } catch {}
-        }
-      }
+      const data = await res.json();
+      if (!res.ok || !data.job_id) throw new Error(data.error || 'Failed to start pipeline');
+      jobId = data.job_id;
     } catch (err: any) {
-      addProgress({ type: 'error', message: err.message });
+      addLog({ type: 'error', message: `❌ ${err.message}` });
+      setProcessing(false);
+      return;
     }
 
-    setProcessing(false);
+    addLog({ type: 'info', message: `🚀 Pipeline started for "${paperLabel.trim()}"` });
+
+    // ── Step 2: Poll /api/poll/:jobId every 3 seconds ─────────────────
+    // Each request is short-lived — Vercel never holds a long connection.
+    pollRef.current = setInterval(async () => {
+      let job: any;
+      try {
+        const res = await fetch(`/api/poll/${jobId}`);
+        if (!res.ok) throw new Error('Status check failed');
+        job = await res.json();
+      } catch {
+        // transient network error — just try again next tick
+        return;
+      }
+
+      // Log when stage label changes (avoids spam)
+      if (job.stage_label && job.stage_label !== lastLabel.current) {
+        const emoji = job.stage === 1 ? '🔍' : job.stage === 2 ? '✏️' : job.stage === 3 ? '🔧' : job.stage === 4 ? '🧪' : '⏳';
+        addLog({ type: 'info', message: `${emoji} ${job.stage_label}` });
+        if (job.rows_total > 0) addLog({ type: 'info', message: `   Questions found: ${job.rows_total}` });
+        lastLabel.current = job.stage_label;
+      }
+
+      if (job.status === 'done') {
+        stopPolling();
+        addLog({ type: 'success', message: `✅ Complete! ${job.rows_total} questions processed.` });
+        addLog({ type: 'info',    message: `📊 Open the dashboard to review results.` });
+        addLog({ type: 'done',    message: 'done' });
+        setDone(true);
+        setProcessing(false);
+      } else if (job.status === 'failed') {
+        stopPolling();
+        addLog({ type: 'error', message: `❌ Pipeline failed: ${job.stage_label}` });
+        if (job.error) {
+          const firstLine = job.error.split('\n').filter(Boolean).pop() || job.error;
+          addLog({ type: 'error', message: firstLine });
+        }
+        setProcessing(false);
+      }
+    }, 3000);
   }
 
   const canProcess = questionPdf && markSchemePdf && paperLabel.trim() && !processing;
@@ -101,7 +136,6 @@ export default function Home() {
       <div style={{ flex: 1, display: 'flex', alignItems: 'flex-start', justifyContent: 'center', padding: '48px 24px' }}>
         <div style={{ width: '100%', maxWidth: 680 }}>
 
-          {/* Title */}
           <div style={{ marginBottom: 36, textAlign: 'center' }}>
             <div style={{ fontFamily: 'Syne,sans-serif', fontSize: 28, fontWeight: 800, color: '#fff', letterSpacing: '-0.02em', marginBottom: 8 }}>
               Process a new subject
@@ -111,22 +145,14 @@ export default function Home() {
             </div>
           </div>
 
-          {/* Form */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
 
-            {/* Paper label */}
             <div>
               <div style={{ fontSize: 10, color: '#555', letterSpacing: '0.1em', marginBottom: 8 }}>SUBJECT / PAPER NAME</div>
-              <input
-                className="input"
-                placeholder="e.g. Biology Paper 1 AQA 2024"
-                value={paperLabel}
-                onChange={e => setPaperLabel(e.target.value)}
-                disabled={processing}
-              />
+              <input className="input" placeholder="e.g. Biology Paper 1 AQA 2024" value={paperLabel}
+                onChange={e => setPaperLabel(e.target.value)} disabled={processing} />
             </div>
 
-            {/* Question PDF */}
             <div>
               <div style={{ fontSize: 10, color: '#555', letterSpacing: '0.1em', marginBottom: 8 }}>QUESTION PAPER PDF</div>
               <label className={`drop-zone ${questionPdf ? 'active' : ''}`}>
@@ -146,7 +172,6 @@ export default function Home() {
               </label>
             </div>
 
-            {/* Mark scheme PDF */}
             <div>
               <div style={{ fontSize: 10, color: '#555', letterSpacing: '0.1em', marginBottom: 8 }}>MARK SCHEME PDF</div>
               <label className={`drop-zone ${markSchemePdf ? 'active' : ''}`}>
@@ -166,7 +191,6 @@ export default function Home() {
               </label>
             </div>
 
-            {/* Process button */}
             <button className="btn-primary" onClick={handleProcess} disabled={!canProcess}>
               {processing ? (
                 <span style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
@@ -177,15 +201,12 @@ export default function Home() {
             </button>
           </div>
 
-          {/* Progress log */}
-          {progress.length > 0 && (
+          {log.length > 0 && (
             <div style={{ marginTop: 28 }}>
               <div style={{ fontSize: 10, color: '#444', letterSpacing: '0.1em', marginBottom: 10 }}>PIPELINE PROGRESS</div>
-              <div
-                ref={progressRef}
-                style={{ background: '#080810', border: '1px solid #1a1a25', borderRadius: 6, padding: 16, height: 300, overflowY: 'auto', fontFamily: 'DM Mono, monospace' }}
-              >
-                {progress.map((p, i) => (
+              <div ref={logRef}
+                style={{ background: '#080810', border: '1px solid #1a1a25', borderRadius: 6, padding: 16, height: 300, overflowY: 'auto' }}>
+                {log.map((p, i) => (
                   <div key={i} style={{ fontSize: 11, lineHeight: 1.8, color: p.type === 'error' ? '#f87171' : p.type === 'success' ? '#4ade80' : p.type === 'done' ? '#a5b4fc' : '#666' }}>
                     <span style={{ color: '#2a2a35', marginRight: 8, userSelect: 'none' }}>{String(i + 1).padStart(3, '0')}</span>
                     {p.message}
@@ -193,7 +214,7 @@ export default function Home() {
                 ))}
                 {processing && (
                   <div style={{ fontSize: 11, color: '#333', lineHeight: 1.8 }} className="pulse">
-                    <span style={{ color: '#1a1a25', marginRight: 8 }}>---</span>running...
+                    <span style={{ color: '#1a1a25', marginRight: 8 }}>---</span>polling railway...
                   </div>
                 )}
               </div>
@@ -203,7 +224,7 @@ export default function Home() {
                   <button className="btn-primary" onClick={() => router.push('/dashboard')}>
                     View Results in Dashboard →
                   </button>
-                  <button className="btn-secondary" onClick={() => { setProgress([]); setDone(false); setQuestionPdf(null); setMarkSchemePdf(null); setPaperLabel(''); }}>
+                  <button className="btn-secondary" onClick={() => { setLog([]); setDone(false); setQuestionPdf(null); setMarkSchemePdf(null); setPaperLabel(''); }}>
                     Process Another
                   </button>
                 </div>
