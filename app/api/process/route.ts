@@ -41,7 +41,7 @@ export async function POST(req: NextRequest) {
     startRes = await fetch(`${RAILWAY_URL}/pipeline/start`, {
       method: 'POST',
       body: railwayForm,
-      // @ts-ignore — required in Node 18 for streaming form bodies
+      // @ts-expect-error
       duplex: 'half',
     });
   } catch (err: any) {

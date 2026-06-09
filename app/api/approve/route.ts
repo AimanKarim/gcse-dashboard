@@ -23,7 +23,7 @@ export async function POST(req: Request) {
     });
 
     const currentVal = res.data.values?.[0]?.[0] || '{}';
-    let scoring: any = {};
+    let scoring: Record<string, unknown> = {};
     try { scoring = JSON.parse(currentVal); } catch {}
 
     scoring.status = 'approved';
@@ -37,8 +37,8 @@ export async function POST(req: Request) {
       requestBody: { values: [[JSON.stringify(scoring)]] },
     });
 
-    return NextResponse.json({ success: true });
-  } catch (err: any) {
-    return NextResponse.json({ error: err.message }, { status: 500 });
+} catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    return NextResponse.json({ error: message }, { status: 500 });
   }
 }
